@@ -1,0 +1,93 @@
+name: Import and verify Mem0 reference
+on:
+  push:
+    paths: ['.github/workflows/import-reference.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: reference-import
+  cancel-in-progress: false
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bulk import pinned Git objects and verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 https://github.com/mem0ai/mem0.git fff8a6472512d1bc1a4bccab8c645b65a1df7fe5
+          python3 - <<'PY'
+          import subprocess as s, os, json
+          from pathlib import Path
+          def git(*a, **kw): return s.check_output(['git',*a],**kw)
+          rev='fff8a6472512d1bc1a4bccab8c645b65a1df7fe5'
+          tree=git('rev-parse',rev+'^{tree}').decode().strip()
+          def parse(raw):
+              out={}
+              for item in raw.split(b'\0'):
+                  if item:
+                      meta,path=item.split(b'\t',1)
+                      out[os.fsdecode(path)]=meta.decode().split()
+              return out
+          entries=parse(git('ls-tree','-rz',rev))
+          excluded={}
+          expected={}
+          for p,(mode,kind,oid) in entries.items():
+              if kind!='blob': excluded[p]='external submodule pointer'
+              elif p.startswith('.github/workflows/'): excluded[p]='upstream workflow disabled'
+              elif any(part in ('enterprise','ee') for part in p.lower().split('/')[:-1]): excluded[p]='commercial path pending license review'
+              elif p.lower().endswith(('.mp4','.mov','.webm','.ttf','.otf','.woff','.woff2','.mp3','.wav','.pdf','.png','.jpg','.jpeg','.gif','.ico','.webp','.avif','.svg')): excluded[p]='asset pending separate redistribution rights review'
+              elif p.startswith('.trillionai/'): raise RuntimeError('Reserved path collision')
+              else: expected[p]=[mode,kind,oid]
+          ids=list(dict.fromkeys(v[2] for v in expected.values()))
+          sizes=git('cat-file','--batch-check=%(objectname) %(objectsize)',input=('\n'.join(ids)+'\n').encode()).decode().splitlines()
+          small=[x.split()[0] for x in sizes if int(x.split()[1])<=2048]
+          raw=git('cat-file','--batch',input=('\n'.join(small)+'\n').encode()) if small else b''
+          pos=0
+          lfs=set()
+          while pos<len(raw):
+              end=raw.index(b'\n',pos)
+              oid,kind,size=raw[pos:end].decode().split()
+              n=int(size)
+              if raw[end+1:end+1+n].startswith(b'version https://git-lfs.github.com/spec/v1\n'): lfs.add(oid)
+              pos=end+2+n
+          for p in list(expected):
+              if expected[p][2] in lfs:
+                  excluded[p]='external LFS asset'
+                  del expected[p]
+          assert 'LICENSE' in expected
+          index=b''.join(f'{mode} {oid}\t'.encode()+os.fsencode(p)+b'\0' for p,(mode,kind,oid) in expected.items())
+          git('read-tree','--empty')
+          git('update-index','-z','--index-info',input=index)
+          staged={p:[v[0],'blob',v[1]] for p,v in parse(git('ls-files','--stage','-z')).items()}
+          missing=sorted(set(expected)-set(staged))
+          mismatch=sorted(p for p in expected.keys() & staged.keys() if expected[p]!=staged[p])
+          assert not missing and not mismatch
+          report=dict(upstream='https://github.com/mem0ai/mem0',upstream_commit=rev,upstream_tree=tree,upstream_tracked_entries=len(entries),upstream_blob_files=sum(v[1]=='blob' for v in entries.values()),expected_source_files=len(expected),verified_source_files=len(expected),excluded_paths=excluded,missing_paths=missing,mismatched_paths=mismatch,extra_paths=sorted(set(staged)-set(expected)),scope='Tracked Git blobs only; no third-party submodule contents or history.')
+          Path('.trillionai').mkdir(exist_ok=True)
+          Path('.trillionai/FILE_INVENTORY.json').write_text(json.dumps(report,indent=2)+'\n')
+          Path('.trillionai/SOURCE_PROVENANCE.txt').write_text(f'Upstream: https://github.com/mem0ai/mem0\nRevision: {rev}\nOriginal tree: {tree}\n')
+          PY
+          git add -f .github/workflows/import-reference.yml .trillionai/FILE_INVENTORY.json .trillionai/SOURCE_PROVENANCE.txt
+          git config user.name "TrillionAI Reference Import"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git diff --cached --quiet || git commit -m "Import and hash-verify Mem0 source"
+          git push origin HEAD:main
+          git fetch origin main
+          test "$(git rev-parse HEAD)" = "$(git rev-parse FETCH_HEAD)"
+          python3 - <<'PY'
+          import subprocess as s, json, os
+          def tree(ref):
+              return {os.fsdecode(p):m.decode().split() for m,p in (x.split(b'\t',1) for x in s.check_output(['git','ls-tree','-rz',ref]).split(b'\0') if x)}
+          report=json.load(open('.trillionai/FILE_INVENTORY.json'))
+          upstream=tree(report['upstream_commit'])
+          expected={p:v for p,v in upstream.items() if p not in report['excluded_paths']}
+          remote=tree('FETCH_HEAD')
+          assert len(expected)==report['verified_source_files']
+          assert all(remote.get(p)==v for p,v in expected.items())
+          assert set(remote)-set(expected)=={'.github/workflows/import-reference.yml','.trillionai/FILE_INVENTORY.json','.trillionai/SOURCE_PROVENANCE.txt'}
+          print('Remote tree verified:',len(expected),'files; zero missing or mismatched')
+          PY
