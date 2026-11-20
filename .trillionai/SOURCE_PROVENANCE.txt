@@ -1,0 +1,3 @@
+Upstream: https://github.com/mem0ai/mem0
+Revision: fff8a6472512d1bc1a4bccab8c645b65a1df7fe5
+Original tree: df21b2597dfa0ee60fd72265387e518ca00875b9
